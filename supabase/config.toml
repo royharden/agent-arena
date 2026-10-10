@@ -1,0 +1,9 @@
+# Agent Arena edge functions
+[functions.llm-player]
+verify_jwt = false
+
+[functions.jev]
+verify_jwt = false
+
+[functions.arena-api]
+verify_jwt = false
