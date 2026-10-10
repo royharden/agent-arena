@@ -40,13 +40,12 @@ export default function TableView({ setup, viewer, onExit, onPointsChange }: Pro
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [events.length]);
 
-  const settleBets = async (winnerSeat: number | null, matchId: string | null) => {
-    // In a real flow bets were placed through arena-api before the match; we
-    // settle Elo + (no-op if no bet) ratings here.
-    const types = setup.seats.map((s) => (s.kind === 'jev' ? 'Jev' : `LLM ${s.persona}`));
-    const updates = types.map((t) => ({ player_type: t, game: setup.game, new_elo: 1200, games_delta: 1 }));
+  const settleBets = async (_winnerSeat: number | null, matchId: string | null) => {
+    // Settlement is fully server-side: arena-api loads the match's bets and
+    // seats from the DB, computes Elo pairwise, and credits payouts. The
+    // client only sends the match_id.
     if (matchId) {
-      await settleMatch(matchId, winnerSeat ?? -1, [], updates);
+      await settleMatch(matchId);
     }
   };
 

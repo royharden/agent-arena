@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Dices, Play, Users, Bot, Cpu, Gauge } from 'lucide-react';
+import { Dices, Moon, Play, Users, Bot, Cpu, Gauge } from 'lucide-react';
 import { PERSONAS, type Persona, type SeatDef, type ViewerState } from '@/lib/types';
 import type { MatchSetup } from '@/App';
 

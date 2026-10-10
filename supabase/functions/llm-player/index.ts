@@ -4,18 +4,6 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Client-Info, Apikey',
 };
 
-const DAILY_CAP = 200;
-
-async function checkCap(fn: string, serviceRoleKey: string, supabaseUrl: string): Promise<boolean> {
-  const day = new Date().toISOString().slice(0, 10);
-  const res = await fetch(`${supabaseUrl}/rest/v1/usage_counters?day=eq.${day}&fn=eq.${fn}&select=calls`, {
-    headers: { apikey: serviceRoleKey, Authorization: `Bearer ${serviceRoleKey}` },
-  });
-  if (!res.ok) return true; // fail open on counter read errors
-  const rows = await res.json();
-  return (rows[0]?.calls ?? 0) < DAILY_CAP;
-}
-
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
@@ -31,9 +19,21 @@ Deno.serve(async (req: Request) => {
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     if (!serviceRoleKey || !supabaseUrl) return json({ error: 'server_config' }, 500);
 
-    if (!(await checkCap('llm-player', serviceRoleKey, supabaseUrl))) {
-      return json({ error: 'daily_cap' }, 429);
-    }
+    // Atomically increment the daily counter and check the cap before making
+    // the upstream call. If the cap is reached, increment_usage returns no
+    // row (NULL), which we treat as "cap reached".
+    const capRes = await fetch(`${supabaseUrl}/rest/v1/rpc/increment_usage`, {
+      method: 'POST',
+      headers: {
+        apikey: serviceRoleKey,
+        Authorization: `Bearer ${serviceRoleKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ p_fn: 'llm-player', p_cap: 200 }),
+    });
+    if (!capRes.ok) return json({ error: 'counter_error' }, 500);
+    const capData = await capRes.json();
+    if (capData !== true) return json({ error: 'daily_cap' }, 429);
 
     const body = await req.json();
     const { game, persona, visible_state, legal_moves } = body as {
@@ -70,30 +70,6 @@ Deno.serve(async (req: Request) => {
 
     const tableTalk = String(parsed.table_talk ?? '').slice(0, 140);
     const privateReasoning = String(parsed.private_reasoning ?? '').slice(0, 200);
-
-    // increment counter (fire and forget)
-    {
-      const day = new Date().toISOString().slice(0, 10);
-      const rpcRes = await fetch(`${supabaseUrl}/rest/v1/rpc/`, { method: 'POST' });
-      void rpcRes;
-      // upsert increment via PostgREST is not atomic; use a simple update + insert
-      const read = await fetch(`${supabaseUrl}/rest/v1/usage_counters?day=eq.${day}&fn=eq.llm-player&select=calls`, {
-        headers: { apikey: serviceRoleKey, Authorization: `Bearer ${serviceRoleKey}` },
-      });
-      const rows = await read.json().catch(() => [] as { calls: number }[]);
-      const current = rows[0]?.calls ?? 0;
-      const method = rows.length ? 'PATCH' : 'POST';
-      await fetch(
-        rows.length
-          ? `${supabaseUrl}/rest/v1/usage_counters?day=eq.${day}&fn=eq.llm-player`
-          : `${supabaseUrl}/rest/v1/usage_counters`,
-        {
-          method,
-          headers: { apikey: serviceRoleKey, Authorization: `Bearer ${serviceRoleKey}`, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates' },
-          body: JSON.stringify(rows.length ? { calls: current + 1 } : { day, fn: 'llm-player', calls: 1 }),
-        },
-      );
-    }
 
     return json({ move: parsed.move, table_talk: tableTalk, private_reasoning: privateReasoning, model });
   } catch (err) {

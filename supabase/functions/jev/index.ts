@@ -4,41 +4,11 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Client-Info, Apikey',
 };
 
-const DAILY_CAP = 200;
 const COST_PER_INPUT_TOKEN = 0.042 / 1_000_000; // USD; output tokens free
 const PINNED_MODEL = 'jev-1.13.0';
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-}
-
-async function checkCap(serviceRoleKey: string, supabaseUrl: string): Promise<boolean> {
-  const day = new Date().toISOString().slice(0, 10);
-  const res = await fetch(`${supabaseUrl}/rest/v1/usage_counters?day=eq.${day}&fn=eq.jev&select=calls`, {
-    headers: { apikey: serviceRoleKey, Authorization: `Bearer ${serviceRoleKey}` },
-  });
-  if (!res.ok) return true;
-  const rows = await res.json();
-  return (rows[0]?.calls ?? 0) < DAILY_CAP;
-}
-
-async function bumpCounter(serviceRoleKey: string, supabaseUrl: string) {
-  const day = new Date().toISOString().slice(0, 10);
-  const read = await fetch(`${supabaseUrl}/rest/v1/usage_counters?day=eq.${day}&fn=eq.jev&select=calls`, {
-    headers: { apikey: serviceRoleKey, Authorization: `Bearer ${serviceRoleKey}` },
-  });
-  const rows = await read.json().catch(() => [] as { calls: number }[]);
-  const current = rows[0]?.calls ?? 0;
-  await fetch(
-    rows.length
-      ? `${supabaseUrl}/rest/v1/usage_counters?day=eq.${day}&fn=eq.jev`
-      : `${supabaseUrl}/rest/v1/usage_counters`,
-    {
-      method: rows.length ? 'PATCH' : 'POST',
-      headers: { apikey: serviceRoleKey, Authorization: `Bearer ${serviceRoleKey}`, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates' },
-      body: JSON.stringify(rows.length ? { calls: current + 1 } : { day, fn: 'jev', calls: 1 }),
-    },
-  );
 }
 
 async function callTypesafe(apiKey: string, payload: unknown): Promise<{ res?: Record<string, unknown>; err?: string; status?: number }> {
@@ -82,13 +52,23 @@ Deno.serve(async (req: Request) => {
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     if (!serviceRoleKey || !supabaseUrl) return json({ error: 'server_config' }, 500);
 
-    if (!(await checkCap(serviceRoleKey, supabaseUrl))) {
-      return json({ error: 'daily_cap' }, 429);
-    }
+    // Atomically increment the daily counter and check the cap before calling
+    // TypeSafe. If the cap is reached, increment_usage returns NULL.
+    const capRes = await fetch(`${supabaseUrl}/rest/v1/rpc/increment_usage`, {
+      method: 'POST',
+      headers: {
+        apikey: serviceRoleKey,
+        Authorization: `Bearer ${serviceRoleKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ p_fn: 'jev', p_cap: 200 }),
+    });
+    if (!capRes.ok) return json({ error: 'counter_error' }, 500);
+    const capData = await capRes.json();
+    if (capData !== true) return json({ error: 'daily_cap' }, 429);
 
     const body = await req.json();
     const { state, questions } = body as {
-      mode: 'player' | 'referee';
       state: Record<string, unknown>;
       questions: Record<string, unknown>;
     };
@@ -109,8 +89,6 @@ Deno.serve(async (req: Request) => {
     const latencyMs = Date.now() - started;
     const costUsd = inputTokens * COST_PER_INPUT_TOKEN;
     const responseModel = String(res.model ?? PINNED_MODEL);
-
-    await bumpCounter(serviceRoleKey, supabaseUrl);
 
     return json({
       answers: res.answers ?? res.choices ?? null,

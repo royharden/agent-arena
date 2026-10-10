@@ -49,28 +49,12 @@ export async function saveMatch(
   }
 }
 
-export async function settleMatch(
-  matchId: string,
-  winnerSeat: number,
-  bets: { id: string; viewer_id: string; stake: number; seat: number; odds: number }[],
-  ratingsUpdates: { player_type: string; game: string; new_elo: number; games_delta: number }[],
-): Promise<{ error?: string }> {
+export async function settleMatch(matchId: string): Promise<{ error?: string }> {
   try {
     const res = await fetch(arenaApiUrl('settle'), {
       method: 'POST',
       headers: edgeHeaders(),
-      body: JSON.stringify({
-        match_id: matchId,
-        winner_seat: winnerSeat,
-        bets: bets.map((b) => ({
-          id: b.id,
-          won: b.seat === winnerSeat,
-          payout: b.seat === winnerSeat ? Math.round(b.stake * b.odds) : 0,
-          viewer_id: b.viewer_id,
-          stake: b.stake,
-        })),
-        ratings_updates: ratingsUpdates,
-      }),
+      body: JSON.stringify({ match_id: matchId }),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));

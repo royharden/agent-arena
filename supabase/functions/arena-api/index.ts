@@ -10,12 +10,39 @@ function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
-interface SeatDef { seat: number; name: string; kind: 'llm' | 'jev'; persona?: string }interface EventRow {
+interface SeatDef { seat: number; name: string; kind: 'llm' | 'jev'; persona?: string }
+interface EventRow {
   seq: number; actor: number; type: string; payload: Record<string, unknown>;
   visible_to?: number[] | null; latency_ms?: number | null; cost_usd?: number | null;
 }
 
-// Ratings settle via pairwise Elo computed client-side per match.
+function seatToPlayerType(s: SeatDef): string {
+  return s.kind === 'jev' ? 'Jev' : `LLM ${s.persona ?? ''}`.trim();
+}
+
+// Multi-player Elo scored pairwise, K = 24.
+function pairwiseElo(
+  elos: Record<string, number>,
+  types: string[],
+  winnerSeat: number,
+  k = 24,
+): Record<string, number> {
+  const out = { ...elos };
+  const n = types.length;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const a = types[i];
+      const b = types[j];
+      if (a === b) continue;
+      const ea = 1 / (1 + Math.pow(10, ((out[b] ?? 1200) - (out[a] ?? 1200)) / 400));
+      const aWon = i === winnerSeat;
+      const bWon = j === winnerSeat;
+      out[a] = (out[a] ?? 1200) + k * ((aWon ? 1 : 0) - ea);
+      out[b] = (out[b] ?? 1200) + k * ((bWon ? 1 : 0) - (1 - ea));
+    }
+  }
+  return out;
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response(null, { status: 200, headers: corsHeaders });
@@ -34,7 +61,7 @@ Deno.serve(async (req: Request) => {
         game: match.game,
         seats: match.seats,
         winner_seat: match.winner_seat,
-        status: 'complete',
+        status: 'in_progress',
       }).select('id').single();
       if (error) return json({ error: error.message }, 500);
       const matchId = inserted.id as string;
@@ -56,34 +83,94 @@ Deno.serve(async (req: Request) => {
     }
 
     if (req.method === 'POST' && action === 'settle') {
-      const { match_id, winner_seat, bets, ratings_updates } = await req.json() as {
-        match_id: string; winner_seat: number;
-        bets: { id: string; won: boolean; payout: number; viewer_id: string; stake: number; refund_stake?: boolean }[];
-        ratings_updates: { player_type: string; game: string; new_elo: number; games_delta: number }[];
-      };
+      const { match_id } = await req.json() as { match_id: string };
 
-      // settle bets: viewer gets payout credited; loser stake already deducted at bet time
-      for (const b of bets) {
-        await db.from('bets').update({ payout: b.won ? b.payout : 0 }).eq('id', b.id);
-        if (b.won) {
+      // Idempotency: if a 'settled' event already exists for this match, reject.
+      const { data: existingSettled } = await db.from('events')
+        .select('id').eq('match_id', match_id).eq('type', 'settled').limit(1);
+      if (existingSettled && existingSettled.length > 0) {
+        return json({ error: 'already_settled' }, 409);
+      }
+
+      // Insert the sentinel 'settled' event to mark settlement in progress.
+      const { error: settleErr } = await db.from('events').insert({
+        match_id,
+        seq: 999999,
+        actor: -1,
+        type: 'settled',
+        payload: {},
+        visible_to: null,
+      });
+      if (settleErr) return json({ error: settleErr.message }, 500);
+
+      // Load the match from DB — never trust client-sent winner/seats.
+      const { data: matchRow, error: matchErr } = await db.from('matches')
+        .select('game, seats, winner_seat').eq('id', match_id).maybeSingle();
+      if (matchErr || !matchRow) return json({ error: 'match_not_found' }, 404);
+
+      const seats = matchRow.seats as unknown as SeatDef[];
+      const winnerSeat = matchRow.winner_seat as number | null;
+      const game = matchRow.game as string;
+
+      if (winnerSeat === null || winnerSeat < 0) {
+        await db.from('matches').update({ status: 'complete' }).eq('id', match_id);
+        return json({ ok: true, note: 'no winner' });
+      }
+
+      // --- Settle bets from DB (ignore client-sent bet data) ---
+      const { data: betRows, error: betErr } = await db.from('bets')
+        .select('id, viewer_id, seat, stake').eq('match_id', match_id).is('payout', null);
+      if (betErr) return json({ error: betErr.message }, 500);
+
+      for (const b of betRows ?? []) {
+        const won = b.seat === winnerSeat;
+        const payout = won ? Math.min(Math.round(b.stake * 10), b.stake * 10) : 0;
+        await db.from('bets').update({ payout }).eq('id', b.id);
+        if (won) {
           const { data: v } = await db.from('viewers').select('points').eq('viewer_id', b.viewer_id).maybeSingle();
           if (v) {
-            await db.from('viewers').update({ points: v.points + b.payout }).eq('viewer_id', b.viewer_id);
+            await db.from('viewers').update({ points: v.points + payout }).eq('viewer_id', b.viewer_id);
           }
         }
       }
 
-      // ratings: only through the edge function
-      for (const r of ratings_updates) {
-        const { data: existing } = await db.from('ratings').select('elo, games').match({ player_type: r.player_type, game: r.game }).maybeSingle();
+      // --- Compute Elo on the server (ignore client-sent ratings) ---
+      const types = seats.map(seatToPlayerType);
+      const uniqueTypes = Array.from(new Set(types));
+
+      // Load current Elo for all involved player types.
+      const currentElos: Record<string, number> = {};
+      for (const t of uniqueTypes) {
+        const { data: r } = await db.from('ratings').select('elo, games')
+          .match({ player_type: t, game }).maybeSingle();
+        currentElos[t] = r ? Number(r.elo) : 1200;
+      }
+
+      const newElos = pairwiseElo(currentElos, types, winnerSeat);
+
+      // Persist updated ratings (games + 1 per seat).
+      const gamesDelta: Record<string, number> = {};
+      for (const t of types) gamesDelta[t] = (gamesDelta[t] ?? 0) + 1;
+
+      for (const t of uniqueTypes) {
+        const { data: existing } = await db.from('ratings').select('elo, games')
+          .match({ player_type: t, game }).maybeSingle();
         if (existing) {
-          await db.from('ratings').update({ elo: r.new_elo, games: existing.games + r.games_delta }).match({ player_type: r.player_type, game: r.game });
+          await db.from('ratings').update({
+            elo: newElos[t],
+            games: existing.games + (gamesDelta[t] ?? 0),
+          }).match({ player_type: t, game });
         } else {
-          await db.from('ratings').insert({ player_type: r.player_type, game: r.game, elo: r.new_elo, games: r.games_delta });
+          await db.from('ratings').insert({
+            player_type: t,
+            game,
+            elo: newElos[t],
+            games: gamesDelta[t] ?? 0,
+          });
         }
       }
 
-      await db.from('matches').update({ status: 'complete', winner_seat }).eq('id', match_id);
+      await db.from('matches').update({ status: 'complete' }).eq('id', match_id);
       return json({ ok: true });
     }
 
