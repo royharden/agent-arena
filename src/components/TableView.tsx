@@ -6,7 +6,7 @@ import {
 import type { MatchSetup } from '@/App';
 import type { MatchEvent, SeatDef, ViewerState } from '@/lib/types';
 import { MatchRunner } from '@/lib/matchRunner';
-import { placeBet, saveMatch, settleMatch, oddsFor } from '@/lib/bets';
+import { placeBet, saveMatch, updateMatch, settleMatch, oddsFor } from '@/lib/bets';
 import { bidOdds, type DiceState } from '@/engine/dice';
 import type { WolfState } from '@/engine/werewolf';
 
@@ -32,6 +32,7 @@ export default function TableView({ setup, viewer, onExit, onPointsChange }: Pro
   const [winner, setWinner] = useState<number | null>(null);
   const [payout, setPayout] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<number | null>(null);
+  const [betMatchId, setBetMatchId] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
   const runnerRef = useRef<MatchRunner | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
@@ -40,10 +41,9 @@ export default function TableView({ setup, viewer, onExit, onPointsChange }: Pro
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [events.length]);
 
-  const settleBets = async (_winnerSeat: number | null, matchId: string | null) => {
+  const settleBets = async (matchId: string | null) => {
     // Settlement is fully server-side: arena-api loads the match's bets and
-    // seats from the DB, computes Elo pairwise, and credits payouts. The
-    // client only sends the match_id.
+    // seats from the DB, computes Elo pairwise, and credits payouts.
     if (matchId) {
       await settleMatch(matchId);
     }
@@ -59,8 +59,17 @@ export default function TableView({ setup, viewer, onExit, onPointsChange }: Pro
       onGameOver: async (winnerSeat) => {
         setWinner(winnerSeat);
         setPhase('done');
-        const res = await saveMatch(setup.game, setup.seats as never, winnerSeat, events);
-        if (res.match_id) await settleBets(winnerSeat, res.match_id);
+        // If we have a bet match ID (match shell created before the game),
+        // update THAT row with the results so the bet pays out. Otherwise
+        // create a new match row.
+        const targetMatchId = betMatchId;
+        if (targetMatchId) {
+          await updateMatch(targetMatchId, winnerSeat, events);
+          await settleBets(targetMatchId);
+        } else {
+          const res = await saveMatch(setup.game, setup.seats as never, winnerSeat, events);
+          await settleBets(res.match_id ?? null);
+        }
         // payout messaging
         if (betSeat === winnerSeat && betSeat !== null) {
           const o = odds[betSeat] ?? 2;
@@ -78,9 +87,11 @@ export default function TableView({ setup, viewer, onExit, onPointsChange }: Pro
 
   const startWithBet = async () => {
     if (betSeat === null) return startPlaying();
-    // create a lightweight match shell to attach the bet to
+    // Create the match shell NOW so bets attach to it, then carry the ID
+    // through to game over where we update the same row with results.
     const res = await saveMatch(setup.game, setup.seats as never, null, []);
     if (res.match_id) {
+      setBetMatchId(res.match_id);
       const b = await placeBet(res.match_id, viewer, betSeat, stake);
       if (b.error) {
         setPayout(`Bet failed: ${b.error}`);

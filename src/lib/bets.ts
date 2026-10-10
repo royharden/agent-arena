@@ -49,6 +49,34 @@ export async function saveMatch(
   }
 }
 
+export async function updateMatch(
+  matchId: string,
+  winnerSeat: number | null,
+  events: MatchEvent[],
+): Promise<{ error?: string }> {
+  try {
+    const res = await fetch(arenaApiUrl('update_match'), {
+      method: 'POST',
+      headers: edgeHeaders(),
+      body: JSON.stringify({
+        match_id: matchId,
+        winner_seat: winnerSeat,
+        events: events.map((e) => ({
+          seq: 0, actor: e.actor, type: e.type, payload: e.payload,
+          visible_to: e.visible_to, latency_ms: e.latency_ms, cost_usd: e.cost_usd,
+        })).map((e, i) => ({ ...e, seq: i })),
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      return { error: body.error ?? `HTTP ${res.status}` };
+    }
+    return {};
+  } catch {
+    return { error: 'network_error' };
+  }
+}
+
 export async function settleMatch(matchId: string): Promise<{ error?: string }> {
   try {
     const res = await fetch(arenaApiUrl('settle'), {

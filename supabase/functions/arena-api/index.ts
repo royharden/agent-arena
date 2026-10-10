@@ -55,6 +55,7 @@ Deno.serve(async (req: Request) => {
     const url = new URL(req.url);
     const action = url.searchParams.get('action');
 
+    // ---- save_match: create a new in-progress match (for pre-game bet shell) ----
     if (req.method === 'POST' && action === 'save_match') {
       const { match, events } = await req.json() as { match: { game: string; seats: SeatDef[]; winner_seat: number | null }; events: EventRow[] };
       const { data: inserted, error } = await db.from('matches').insert({
@@ -82,17 +83,38 @@ Deno.serve(async (req: Request) => {
       return json({ match_id: matchId });
     }
 
+    // ---- update_match: record results on an existing match row (the one bets were placed on) ----
+    if (req.method === 'POST' && action === 'update_match') {
+      const { match_id, winner_seat, events } = await req.json() as {
+        match_id: string; winner_seat: number | null; events: EventRow[];
+      };
+      const { error: updErr } = await db.from('matches')
+        .update({ winner_seat, status: 'complete' }).eq('id', match_id);
+      if (updErr) return json({ error: updErr.message }, 500);
+      const rows = events.map((e) => ({
+        match_id,
+        seq: e.seq,
+        actor: e.actor,
+        type: e.type,
+        payload: e.payload,
+        visible_to: e.visible_to ?? null,
+        latency_ms: e.latency_ms ?? null,
+        cost_usd: e.cost_usd ?? null,
+      }));
+      if (rows.length) {
+        const { error: evErr } = await db.from('events').insert(rows);
+        if (evErr) return json({ error: evErr.message, match_id }, 500);
+      }
+      return json({ match_id });
+    }
+
+    // ---- settle: idempotent, server-side bet payout + Elo ----
     if (req.method === 'POST' && action === 'settle') {
       const { match_id } = await req.json() as { match_id: string };
 
-      // Idempotency: if a 'settled' event already exists for this match, reject.
-      const { data: existingSettled } = await db.from('events')
-        .select('id').eq('match_id', match_id).eq('type', 'settled').limit(1);
-      if (existingSettled && existingSettled.length > 0) {
-        return json({ error: 'already_settled' }, 409);
-      }
-
-      // Insert the sentinel 'settled' event to mark settlement in progress.
+      // Insert the sentinel 'settled' event. The unique partial index
+      // events_one_settled guarantees only one can exist per match — if a
+      // concurrent settle already inserted one, this fails with 23505.
       const { error: settleErr } = await db.from('events').insert({
         match_id,
         seq: 999999,
@@ -101,7 +123,10 @@ Deno.serve(async (req: Request) => {
         payload: {},
         visible_to: null,
       });
-      if (settleErr) return json({ error: settleErr.message }, 500);
+      if (settleErr) {
+        if (settleErr.code === '23505') return json({ error: 'already_settled' }, 409);
+        return json({ error: settleErr.message }, 500);
+      }
 
       // Load the match from DB — never trust client-sent winner/seats.
       const { data: matchRow, error: matchErr } = await db.from('matches')
@@ -117,7 +142,7 @@ Deno.serve(async (req: Request) => {
         return json({ ok: true, note: 'no winner' });
       }
 
-      // --- Settle bets from DB (ignore client-sent bet data) ---
+      // --- Settle bets from DB ---
       const { data: betRows, error: betErr } = await db.from('bets')
         .select('id, viewer_id, seat, stake').eq('match_id', match_id).is('payout', null);
       if (betErr) return json({ error: betErr.message }, 500);
@@ -134,11 +159,10 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // --- Compute Elo on the server (ignore client-sent ratings) ---
+      // --- Compute Elo on the server ---
       const types = seats.map(seatToPlayerType);
       const uniqueTypes = Array.from(new Set(types));
 
-      // Load current Elo for all involved player types.
       const currentElos: Record<string, number> = {};
       for (const t of uniqueTypes) {
         const { data: r } = await db.from('ratings').select('elo, games')
@@ -148,7 +172,6 @@ Deno.serve(async (req: Request) => {
 
       const newElos = pairwiseElo(currentElos, types, winnerSeat);
 
-      // Persist updated ratings (games + 1 per seat).
       const gamesDelta: Record<string, number> = {};
       for (const t of types) gamesDelta[t] = (gamesDelta[t] ?? 0) + 1;
 
@@ -174,15 +197,52 @@ Deno.serve(async (req: Request) => {
       return json({ ok: true });
     }
 
+    // ---- place_bet: hardened validation ----
     if (req.method === 'POST' && action === 'place_bet') {
       const { match_id, viewer_id, nickname, seat, stake } = await req.json() as {
         match_id: string; viewer_id: string; nickname: string; seat: number; stake: number;
       };
+
+      // Validate stake is a positive integer.
+      if (!Number.isInteger(stake) || stake <= 0) {
+        return json({ error: 'invalid_stake' }, 400);
+      }
+
+      // Reject if match doesn't exist.
+      const { data: matchRow, error: matchErr } = await db.from('matches')
+        .select('winner_seat').eq('id', match_id).maybeSingle();
+      if (matchErr || !matchRow) return json({ error: 'match_not_found' }, 404);
+
+      // Reject if match already has a winner (game is over).
+      if (matchRow.winner_seat !== null) {
+        return json({ error: 'match_already_finished' }, 409);
+      }
+
+      // Reject if match already has a settled event.
+      const { data: settledRows } = await db.from('events')
+        .select('id').eq('match_id', match_id).eq('type', 'settled').limit(1);
+      if (settledRows && settledRows.length > 0) {
+        return json({ error: 'match_already_settled' }, 409);
+      }
+
+      // Auto-create viewer row if missing (default 1000 points).
       const { data: v } = await db.from('viewers').select('points').eq('viewer_id', viewer_id).maybeSingle();
-      if (!v) return json({ error: 'viewer_not_found' }, 404);
-      if (v.points < stake) return json({ error: 'insufficient_points' }, 400);
-      await db.from('viewers').update({ points: v.points - stake }).eq('viewer_id', viewer_id);
-      const { data: bet, error } = await db.from('bets').insert({ match_id, viewer_id, nickname, seat, stake }).select('id').single();
+      if (!v) {
+        await db.from('viewers').insert({ viewer_id, nickname, points: 1000 });
+      }
+
+      // Deduct points atomically via RPC: only succeeds if points >= stake.
+      const { data: deductData, error: deductErr } = await db.rpc('deduct_points', {
+        p_viewer_id: viewer_id,
+        p_amount: stake,
+      });
+      if (deductErr) return json({ error: deductErr.message }, 500);
+      if (deductData === null) {
+        return json({ error: 'insufficient_points' }, 400);
+      }
+
+      const { data: bet, error } = await db.from('bets')
+        .insert({ match_id, viewer_id, nickname, seat, stake }).select('id').single();
       if (error) return json({ error: error.message }, 500);
       return json({ bet_id: bet.id });
     }
