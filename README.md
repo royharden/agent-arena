@@ -44,7 +44,7 @@ flowchart TD
 
 ## Daily usage cap
 
-Calls per function per UTC day are counted in `usage_counters(day, fn, calls)`, checked inside `llm-player` and `jev`. Above **200 calls/day per function** they return HTTP 429 `{error:"daily_cap"}` and the UI shows the replay-mode banner.
+Every paid upstream request (each attempt, retries included) is counted in `usage_counters(day, fn, calls)` via the service-role-only `increment_usage_counter` RPC, right before the fetch inside `llm-player` and `jev`. Above **200 calls/day per function** (override with the `DAILY_CALL_LIMIT` secret) they return HTTP 429 `{error:"daily_limit"}`; if the counter can't be read they fail closed with 503. The match keeps running: Jev seats fall back to the best-odds move and LLM seats take the referee fallback move.
 
 If the OpenAI key is missing, matches run with **Mock players** (scripted persona bots). Jev still runs live in mock mode when its key exists.
 
@@ -72,8 +72,9 @@ npm run dev
 | `OPENAI_API_KEY` | Supabase secret | LLM persona players (falls back to mock bots if absent) |
 | `OPENAI_BASE_URL` | Supabase secret (optional) | Override OpenAI-compatible endpoint |
 | `OPENAI_MODEL` | Supabase secret (optional) | Model id (default `gpt-6-luna`) |
+| `DAILY_CALL_LIMIT` | Supabase secret (optional) | Paid upstream calls per function per UTC day (default `200`) |
 | `VITE_SUPABASE_URL` | client env | Supabase project URL |
-| `VITE_SUPABASE_ANON_KEY` | client env | Supabase anon key (public reads/writes via RLS) |
+| `VITE_SUPABASE_ANON_KEY` | client env | Supabase anon key (public reads via RLS; all writes go through `arena-api`) |
 
 ## Screenshots
 

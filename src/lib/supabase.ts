@@ -12,6 +12,7 @@ export function edgeUrl(fn: string): string {
 export function edgeHeaders(): Record<string, string> {
   return {
     Authorization: `Bearer ${supabaseAnonKey}`,
+    apikey: supabaseAnonKey,
     'Content-Type': 'application/json',
   };
 }
